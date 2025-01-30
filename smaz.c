@@ -1,4 +1,11 @@
 #include <string.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+
+#define SMAZ_DEBUG
+#define SMAZPRINTF printf
 
 /* Our compression codebook, used for compression */
 static char *Smaz_cb[241] = {
@@ -76,7 +83,13 @@ static char *Smaz_rcb[254] = {
 "e, ", " it", "whi", " ma", "ge", "x", "e c", "men", ".com"
 };
 
-int smaz_compress(char *in, int inlen, char *out, int outlen) {
+
+#ifdef SMAZ_DEBUG /* for checking word frequencies */
+    static unsigned int smaz_used[(sizeof(Smaz_rcb)/sizeof(Smaz_rcb[0])) + 1] = {0};
+#endif
+
+
+int smaz_compress(const char *in, int inlen, char *out, int outlen) {
     unsigned int h1,h2,h3=0;
     int verblen = 0, _outlen = outlen;
     char verb[256], *_out = out;
@@ -112,6 +125,10 @@ int smaz_compress(char *in, int inlen, char *out, int outlen) {
                     /* Emit the byte */
                     if (outlen <= 0) return _outlen+1;
                     out[0] = slot[slot[0]+1];
+#ifdef SMAZ_DEBUG
+                    unsigned int index = (unsigned char)slot[slot[0]+1];
+                    smaz_used[index]++;
+#endif
                     out++;
                     outlen--;
                     inlen -= j;
@@ -192,3 +209,447 @@ int smaz_decompress(char *in, int inlen, char *out, int outlen) {
     }
     return out-_out;
 }
+
+/* SMAZ debug functions */
+#ifdef SMAZ_DEBUG
+static void smaz_print_cb_entry(const char *txt, unsigned int len, unsigned int index)
+{
+/* Prints the the reverse codebook entries formatted for the codebook
+ * uses a small buffer to parse for escape characters and convert them
+ * back to plaintext escapes
+ * '\000text\000'
+ * first octal escape is the length of the word
+ * the actual word
+ * last octal escape is the index in the reverse codebook
+ */
+
+    char emit_buf[64];
+    unsigned int p = 0;
+    SMAZPRINTF("\\%.03o", len);
+    for (unsigned int i= 0; i < len; i++)
+    {
+        if (p + 3 >= sizeof(emit_buf))
+        {
+            emit_buf[p] = '\0';
+            SMAZPRINTF("%s", emit_buf);
+            p = 0;
+        }
+        char c = txt[i];
+        if (NULL == strchr("\r\n\t\f", c))
+        {
+            emit_buf[p++] = c;
+        }
+        else
+        {
+            emit_buf[p++] = '\\';
+            if (c == '\r')
+                emit_buf[p++] = 'r';
+            else if (c == '\n')
+                emit_buf[p++] = 'n';
+            else if (c == '\t')
+                emit_buf[p++] = 't';
+            else if (c == '\f')
+                emit_buf[p++] = 'f';
+        }
+    }
+    if (p > 0) /* bytes left to flush? */
+    {
+        emit_buf[p] = '\0';
+        SMAZPRINTF("%s", emit_buf);
+    }
+
+    SMAZPRINTF("\\%.03o", index);
+}
+
+static size_t smaz_debug_print_rcb(void)
+{
+/* Prints the the reverse codebook entries formatted for the codebook */
+    unsigned int i;
+    unsigned int rcb_count = (sizeof(Smaz_rcb)/sizeof(Smaz_rcb[0]));
+    unsigned int rcb_empty = 0;
+    size_t bytes_used = 0;
+    const char *trcb;
+
+    SMAZPRINTF("\n\n Reverse Codebook:\n\n");
+    SMAZPRINTF("[index](octal) 'reverse code' [\\lenReverse_code\\idx]\n");
+    trcb = Smaz_rcb[0];
+
+    for (i = 0; i < rcb_count; i++)
+    {
+        trcb = Smaz_rcb[i];
+
+        if (!trcb || !*trcb)
+        {
+            rcb_empty++;
+            SMAZPRINTF("[%d](\\%.03o) '',\n", i, i);
+            bytes_used += 1;
+        }
+
+        else
+        {
+            int inlen = strlen(trcb);
+            bytes_used += inlen + 1;
+            SMAZPRINTF("[%d](\\%.03o)  [", i, i);
+            smaz_print_cb_entry(trcb, inlen, i);
+            SMAZPRINTF("],\n");
+        }
+    }
+
+    SMAZPRINTF("%d entries available\n %ld bytes used\n", rcb_empty, bytes_used);
+
+    return bytes_used;
+}
+
+static void smaz_debug_print_word_freq(void)
+{
+    SMAZPRINTF("\nFrequency Table:\n [index] 'word' (len) x (freq) (used bytes)\n");
+    size_t total = 0;
+    size_t replaced = 0;
+    for (unsigned int i = 0; i < (sizeof(Smaz_rcb)/sizeof(Smaz_rcb[0])); i++)
+    {
+        size_t len = strlen(Smaz_rcb[i]);
+        size_t used = smaz_used[i];
+        if (used > 0)
+        {
+            SMAZPRINTF("\t[%d] '%s'\t (%ld) x (%lu) - 1 = [%ld]\n",
+                       i, Smaz_rcb[i], len, used, (len * used - 1) - 2);
+            total += (len * used - 1) - 1; /*+NULL byte*/
+            replaced += (len * used) - 1;
+        }
+        else
+        {
+            SMAZPRINTF("\t[%d] '%s'\t (%ld) x (%d) - 1 = [%ld]\n",
+                       i, Smaz_rcb[i], len, 0, -(len + 1));
+            total -= (len + 2); /*+NULL + verbatim byte marker */
+        }
+    }
+    SMAZPRINTF("Total bytes saved: %ld replaced total: %ld\n\n", total, replaced);
+}
+
+static void smaz_debug_current_codebook(void)
+{
+    #define MODSZ(c) (c%cb_count)
+    unsigned int cb_count = (sizeof(Smaz_cb)/sizeof(Smaz_cb[0]));
+    unsigned int rcb_count = (sizeof(Smaz_rcb)/sizeof(Smaz_rcb[0]));
+
+    #define SMAZHASH(ha1, ha2, ha3, txt, len) \
+    {                                         \
+        ha3 =0; ha1 = ha2 = ((txt)[0])<<3;     \
+        if (len > 1) ha2 += (txt)[1];         \
+        if (len > 2) ha3 = (ha2)^(txt)[2];    \
+    }
+
+    unsigned int i, j;
+    const char *trcb;
+    size_t cbe_len;
+
+    SMAZPRINTF("\n\n Current Codebook:\n\n");
+    SMAZPRINTF("'codebook' [index](octal) 'reverse'\n");
+    for (i = 0; i < cb_count; i++)
+    {
+        const unsigned char *cb = Smaz_cb[i];
+        if (!cb)
+        {
+            SMAZPRINTF("ERROR [%d] NULL entry!\n", i);
+            continue;
+        }
+        cbe_len = strlen(cb);
+        /*SMAZPRINTF("Next: %s, len: %d\n", cb, cbe_len);*/
+continue_dump:
+        const char *rcb = NULL;
+        if (!cb || !cb[0])
+        {
+            SMAZPRINTF("[%d] '',\n", i);
+            continue;
+        }
+        unsigned int cb_len = *cb;
+        for (j = 0; j < rcb_count; j++)
+        {
+            trcb = Smaz_rcb[j];
+            if (!trcb[0])
+                continue;
+
+            const unsigned char*match = strstr(cb+1, trcb);
+
+            if (match != NULL && match - cb <= cb_len && *(match - 1) == cb_len)
+            {
+                rcb = Smaz_rcb[j];
+                if (cb_len != strlen(rcb))
+                    continue;
+                unsigned int inlen = strlen(rcb);
+                unsigned int h1,h2,h3;
+                unsigned int hash = 0;
+
+                SMAZHASH(h1, h2, h3, rcb, inlen);
+
+                if (inlen >= 3)
+                    hash = MODSZ(h3);
+                else if (inlen >= 2)
+                    hash = MODSZ(h2);
+                else if (inlen > 0)
+                    hash = MODSZ(h1);
+
+                if (hash != i)
+                {
+                    SMAZPRINTF("ERROR! [%d] '%s' index mismatch [%d] != hash [%d] of '%s',\n",
+                               i, cb+1, i, hash, rcb);
+                    continue;
+                }
+                break;
+            }
+        }
+
+        if (rcb)
+        {
+            if (cb_len != strlen(rcb))
+            {
+                SMAZPRINTF("ERROR! [%d] '%s' [%d] != [%ld] '%s',\n",
+                           i, cb+1, *cb, strlen(rcb), rcb);
+                continue;
+            }
+            unsigned int cb_index = cb[cb_len+1];
+            if (cb_index != j)
+            {
+                SMAZPRINTF("%d '%s'", cb_len, cb);
+                SMAZPRINTF("ERROR! [%d] '%s' index mismatch [%d] != [%d] '%s',\n",
+                           i, cb+1, cb_index, j, rcb);
+                continue;
+            }
+            SMAZPRINTF("[%d] '%.*s' [%d](\\%.03o) '%s',\n",
+                       i, cb_len, cb+1, j, j, rcb);
+
+            if (cbe_len > cb_len + 2)
+            {
+                cb+= cb_len + 2;
+                cbe_len -= (cb_len + 2); /* to account for the first and last byte */
+                goto continue_dump;
+            }
+        }
+        else
+        {
+            SMAZPRINTF("ERROR ![%d] '%s' [0] '' !NO MATCH!,\n", i, cb+1);
+            continue;
+        }
+    }
+#undef MODSZ
+#undef SMAZHASH
+}
+
+static void smaz_debug(void)
+{
+    #define MODSZ(c) (c%cb_count)
+    unsigned int cb_count = (sizeof(Smaz_cb)/sizeof(Smaz_cb[0]));
+    unsigned int rcb_count = (sizeof(Smaz_rcb)/sizeof(Smaz_rcb[0]));
+    static bool rcb_found[(sizeof(Smaz_rcb)/sizeof(Smaz_rcb[0]))] = {false};
+
+    #define SMAZHASH(ha1, ha2, ha3, txt, len) \
+    {                                         \
+        ha3 =0; ha1 = ha2 = ((txt)[0])<<3;     \
+        if (len > 1) ha2 += (txt)[1];         \
+        if (len > 2) ha3 = (ha2)^(txt)[2];    \
+    }
+//SMAZPRINTF("inlen: %d h1:%d h2:%d h3:%d '%s'\n", len, MODSZ(ha1), MODSZ(ha2), MODSZ(ha3), txt);
+    unsigned int i, j;
+    const char *trcb;
+    bool first = true;
+
+    for (i = 0; i < rcb_count; i++)
+    {
+        rcb_found[i] = false;
+    }
+    trcb = Smaz_rcb[0];
+
+    for (i = 0; i < rcb_count; i++)
+    {
+        trcb = Smaz_rcb[i];
+
+        if (!trcb || !*trcb)
+        {
+            rcb_found[i] = true; /* don't need to check these again */
+        }
+    }
+
+    for (i = 0; i < rcb_count; i++)
+    {
+        if (!rcb_found[i])
+        {
+            if (first)
+                SMAZPRINTF("\nGenerated codebook:\n\n[0 ... %d] = \"\",\n", cb_count - 1);
+            first = false;
+            const char* trcb = Smaz_rcb[i];
+
+            unsigned int inlen = strlen(trcb);
+            unsigned int h1,h2,h3;
+            SMAZHASH(h1, h2, h3, trcb, inlen);
+
+            if (false && inlen>0)
+            {
+                SMAZPRINTF("%c %c %c '%s'\n", trcb[0],trcb[1],trcb[2], &trcb[3]);
+                SMAZPRINTF("index[%d]'%c' - '%s' h1:%u h2:%u h3:%u \n", i, trcb[0],
+                   trcb, MODSZ(h1), MODSZ(h2), MODSZ(h3));
+            }
+            unsigned int hash = 0;
+            if (inlen >= 3)
+                hash = MODSZ(h3);
+            else if (inlen == 2)
+                hash = MODSZ(h2);
+            else if (inlen > 0)
+                hash = MODSZ(h1);
+            else
+            {
+                continue;
+            }
+
+
+            rcb_found[i] = true;
+            /* emit this one */
+            SMAZPRINTF("[%d] = \"", hash);
+            smaz_print_cb_entry(trcb, inlen, i);
+
+            /* check for others in the same bin*/
+            for (j = 0; j < rcb_count; j++)
+            {
+               if (rcb_found[j])
+                    continue;
+                const unsigned char* v_trcb = Smaz_rcb[j];
+
+                unsigned int v_inlen = strlen(v_trcb);
+                unsigned int v1,v2,v3;
+                SMAZHASH(v1, v2, v3, v_trcb, v_inlen);
+                unsigned int v_hash = 0;
+                if (v_inlen >= 3)
+                    v_hash = MODSZ(v3);
+                else if (v_inlen == 2)
+                    v_hash = MODSZ(v2);
+                else if (v_inlen > 0)
+                    v_hash = MODSZ(v1);
+                else
+                {
+                    continue;
+                }
+                if (hash == v_hash)
+                {
+                    /* emit to the current bin */
+                    rcb_found[j] = true;
+                    smaz_print_cb_entry(v_trcb, v_inlen, j);
+                }
+
+            }
+            SMAZPRINTF("\",\n"); /* closing line */
+        }
+    }
+
+    first = true;
+    for (i = 0; i < rcb_count; i++)
+    {
+        if (!rcb_found[i])
+        {
+            if (first)
+                SMAZPRINTF("\nEntries not referenced by codebook:\n\n");
+            first = false;
+            const unsigned char* trcb = Smaz_rcb[i];
+            SMAZPRINTF("[%d] '%s'\n",i, trcb);
+            int inlen = strlen(trcb);
+            SMAZPRINTF("[%d](\\%.03o) '%s' [\\%.03o%s\\%.03o],\n",
+                       i, i, trcb, inlen, trcb, i);
+            unsigned int h1,h2,h3=0;
+            h1 = h2 = trcb[0]<<3;
+            if (inlen > 1) h2 += trcb[1];
+            if (inlen > 2) h3 = h2^trcb[2];
+
+            unsigned int hash = 0;
+            if (inlen >= 3)
+                hash = MODSZ(h3);
+            else if (inlen == 2)
+                hash = MODSZ(h2);
+            else if (inlen > 0)
+                hash = MODSZ(h1);
+            else
+            {
+                continue;
+            }
+            SMAZPRINTF("match 1[%d][\\%.03o%s\\%.03o]\n", hash, inlen, trcb , i);
+        }
+    }
+
+    SMAZPRINTF("\n\n");
+#undef MODSZ
+#undef SMAZHASH
+}
+
+int main()
+{
+    static char *test[10] = {
+    "This is a small string",
+    "foobar",
+    "the end",
+    "not-a-g00d-Exampl333",
+    "Smaz is a simple compression library",
+    "Nothing is more difficult, and therefore more precious, than to be able to decide",
+    "this is an example of what works very well with smaz",
+    "1000 numbers 2000 will 10 20 30 compress very little",
+    "http://programming.reddit.com",
+    "http://github.com/antirez/smaz/tree/master",
+    };
+    
+    char c;
+    
+    smaz_debug_print_rcb();
+    printf("Press enter to continue\n");
+    while ((c = getchar()) != '\n' && c != EOF);
+    
+    smaz_debug_current_codebook();
+    printf("Press enter to continue\n");
+    while ((c = getchar()) != '\n' && c != EOF);
+    
+    smaz_debug();
+    printf("Press enter to continue\n");
+    while ((c = getchar()) != '\n' && c != EOF);
+
+
+    static char buf[128]; 
+    static char buf2[128];
+    size_t total = 0;
+    size_t total_comp = 0;
+    unsigned int rcb_count = (sizeof(Smaz_rcb)/sizeof(Smaz_rcb[0]));
+    for (unsigned int i = 0; i < rcb_count + 10; i++)
+    {
+        const char *word;
+        if (i < rcb_count)
+            word = Smaz_rcb[i];
+        else
+            word = test[i-rcb_count];
+
+        if (!word || !*word)
+            continue;
+        size_t len = strlen(word);
+        char* res = buf;
+        size_t res_len = smaz_compress(word, len, buf, sizeof(buf));
+        if (res_len >= sizeof(buf))
+            continue;
+        buf[res_len] = '\0';
+        total_comp += res_len;
+        SMAZPRINTF("In: %ld '%s'\n", len, word);
+        SMAZPRINTF("[%d] diff(%ld) len: %lu '%s' len: %lu '%s' \n",
+                   i, len - res_len, len, word, res_len, res);
+
+        res_len = smaz_decompress(res, res_len, buf2, sizeof(buf2));
+        if (res_len >= sizeof(buf2))
+            continue;
+        buf2[res_len] = '\0';
+        SMAZPRINTF("decoder out: %ld '%s'\n\n", res_len, buf2);
+        if (strcmp(word, buf2) != 0)
+        {
+            SMAZPRINTF("!!BAD MATCH!!@\n\n\n");
+            return 0;
+        }
+
+        total += len + 1;
+    }
+
+    smaz_debug_print_word_freq();
+
+
+    return 0;
+}
+#endif
