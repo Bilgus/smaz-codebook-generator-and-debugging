@@ -64,6 +64,11 @@ compressed string (less then or equal to outlen) is returned. This function will
 not automatically put a nul-term at the end of the string if the original
 compressed string didn't included a nulterm.
 
+DEBUG
+-----
+provided are smaz debug functions to test your current codebook
+or generate a new codebook to go with a supplied reverse codebook
+
 
 CREDITS
 -------
